@@ -83,7 +83,7 @@
 
         <nav id="sidebar" class="sidebar" aria-label="Table of contents">
             <div class="sidebar-scrollbox">
-                <ol class="chapter"><li class="chapter-item expanded affix "><a href="introduction.html">Introduction</a></li></ol>
+                <ol class="chapter"><li class="chapter-item expanded affix "><a href="introduction.html">Introduction</a></li><li class="chapter-item expanded "><a href="0030-protocol-messages.html">0030-protocol-messages</a></li><li class="chapter-item expanded "><a href="0031-configuration.html">0031-configuration</a></li><li class="chapter-item expanded "><a href="0033-bee-network.html">0033-bee-network</a></li></ol>
             </div>
             <div id="sidebar-resize-handle" class="sidebar-resize-handle"></div>
         </nav>
@@ -150,6 +150,7 @@
                 <div id="content" class="content">
                     <main>
                         <h1><a class="header" href="#bee-rfcs" id="bee-rfcs">Bee RFCs</a></h1>
+<p><a href="https://iotaledger.github.io/bee-rfcs/"><img src="https://github.com/iotaledger/bee-rfcs/workflows/Bee%20RFC%20Book/badge.svg" alt="Bee RFC Book" /></a></p>
 <blockquote>
 <p>This process is modelled after the approach taken by the Rust programming language, see <a href="https://github.com/rust-lang/rfcs">Rust RFC repository</a> for more
 information. Also see <a href="https://github.com/maidsafe/rfcs">maidsafe's RFC process</a> for another project into the crypto space. Our approach is taken and
@@ -278,6 +279,780 @@ the process be driven by consensus and community norms, not impose more structur
 <p>This project is licensed under Apache License, Version 2.0, (<a href="https://github.com/iotaledger/bee-rfcs/blob/master/LICENSE-APACHE">LICENSE-APACHE</a> or
 http://www.apache.org/licenses/LICENSE-2.0). Any contribution intentionally submitted for inclusion in the work by you,
 as defined in the Apache-2.0 license, shall be licensed as above, without any additional terms or conditions.</p>
+<ul>
+<li>Feature name: <code>protocol-messages</code></li>
+<li>Start date: 2020-04-27</li>
+<li>RFC PR: <a href="https://github.com/iotaledger/bee-rfcs/pull/30">iotaledger/bee-rfcs#30</a></li>
+<li>Bee issue: <a href="https://github.com/iotaledger/bee/issues/70">iotaledger/bee#70</a></li>
+</ul>
+<h1><a class="header" href="#summary" id="summary">Summary</a></h1>
+<p>This RFC introduces the IOTA protocol messages that were initially added in
+<a href="https://github.com/iotaledger/iri/pull/1393">IRI#1393</a>.</p>
+<h1><a class="header" href="#motivation" id="motivation">Motivation</a></h1>
+<p>To be able to take part in the IOTA networks, Bee nodes need to implement the exact same protocol presented in this RFC
+and currently being used by <a href="https://github.com/iotaledger/iri">IRI</a> nodes and
+<a href="https://github.com/gohornet/hornet">HORNET</a> nodes. However, it does not necessarily mean implementing the same versions
+of the protocol. A design decision - later explained - concludes that Bee nodes and IRI nodes will not be able to
+communicate with each other.</p>
+<h1><a class="header" href="#detailed-design" id="detailed-design">Detailed design</a></h1>
+<p>This section details:</p>
+<ul>
+<li>The <code>Message</code> trait that provides serialization and deserialization of messages to and from byte buffers;</li>
+<li>A type-length-value protocol - on top of the trait - that adds metadata in order to send and receive the messages over
+a transport layer;</li>
+<li>The current <code>Message</code> implementations representing handshake, requests, responses, events, ...;</li>
+</ul>
+<h2><a class="header" href="#message-trait" id="message-trait"><code>Message</code> trait</a></h2>
+<p>The <code>Message</code> trait is protocol agnostic and only provides serialization and deserialization to and from byte buffers.
+It should not be used as is but rather be paired with a higher layer - like a type-length-value encoding - and as such
+does not provide any bounds check on inputs/outputs buffers.</p>
+<pre><pre class="playpen"><code class="language-rust">
+<span class="boring">#![allow(unused_variables)]
+</span><span class="boring">fn main() {
+</span>/// A trait describing the behavior of a message.
+trait Message {
+    /// The unique identifier of the message within the protocol.
+    const ID: u8;
+
+    /// Returns the size range of the message as it can be compressed.
+    fn size_range() -&gt; Range&lt;usize&gt;;
+
+    /// Deserializes a byte buffer into a message.
+    /// Panics if the provided buffer has an invalid size.
+    /// The size of the buffer should be within the range returned by the `size_range` method.
+    fn from_bytes(bytes: &amp;[u8]) -&gt; Self;
+
+    /// Returns the size of the message.
+    fn size(&amp;self) -&gt; usize;
+
+    /// Serializes a message into a byte buffer.
+    /// Panics if the provided buffer has an invalid size.
+    /// The size of the buffer should be equal to the one returned by the `size` method.
+    fn into_bytes(self, bytes: &amp;mut [u8]);
+}
+<span class="boring">}
+</span></code></pre></pre>
+<p><strong>Notes</strong>:</p>
+<ul>
+<li><code>size_range</code> returns an allowed range for the message size because some parts of some messages can be trimmed. It is
+used to check if a message coming from a transport layer has a valid size. More details on compression below;</li>
+<li><code>from_bytes</code>/<code>into_bytes</code> panic if incorrectly used, only the following safe TLV module should directly use them;</li>
+<li><code>into_bytes</code> does not allocate a buffer because the following TLV protocol implies concatenating a header inducing
+another allocation. Since this is a hot path, a slice of an already allocated buffer for both the header and payload
+is expected; hence, limiting the amount of allocation to the bare minimum;</li>
+</ul>
+<h2><a class="header" href="#type-length-value-protocol" id="type-length-value-protocol">Type-length-value protocol</a></h2>
+<p>The <a href="https://en.wikipedia.org/wiki/Type-length-value">type-length-value</a> module is a safe layer on top of the messages.
+It allows serialization/deserialization to/from a byte buffer ready to be sent/received to/from a transport layer by
+prepending or reading a header containing the type and length of the payload.</p>
+<h3><a class="header" href="#header" id="header">Header</a></h3>
+<pre><pre class="playpen"><code class="language-rust">
+<span class="boring">#![allow(unused_variables)]
+</span><span class="boring">fn main() {
+</span>/// A header for the type-length-value encoding.
+struct Header {
+    /// Type of the message.
+    message_type: u8,
+    /// Length of the message.
+    message_length: u16,
+}
+<span class="boring">}
+</span></code></pre></pre>
+<h3><a class="header" href="#methods" id="methods">Methods</a></h3>
+<pre><pre class="playpen"><code class="language-rust">
+<span class="boring">#![allow(unused_variables)]
+</span><span class="boring">fn main() {
+</span>/// Deserializes a TLV header and a byte buffer into a message.
+/// * The advertised message type should match the required message type.
+/// * The advertised message length should match the buffer length.
+/// * The buffer length should be within the allowed size range of the required message type.
+fn tlv_from_bytes&lt;M: Message&gt;(header: &amp;Header, bytes: &amp;[u8]) -&gt; Result&lt;M, TlvError&gt; {
+    ...
+}
+
+/// Serializes a TLV header and a message into a byte buffer.
+fn tlv_into_bytes&lt;M: Message&gt;(message: M) -&gt; Vec&lt;u8&gt; {
+    ...
+}
+<span class="boring">}
+</span></code></pre></pre>
+<h2><a class="header" href="#messages" id="messages">Messages</a></h2>
+<p>Since the various types of messages are constructed with different kind of data, there can not be a single constructor
+signature in the <code>Message</code> trait. Implementations are then expected to provide a convenient <code>new</code> method to build them.</p>
+<h3><a class="header" href="#endianness" id="endianness">Endianness</a></h3>
+<p>All multi-byte number fields of the messages of the protocol are represented as
+<a href="https://en.wikipedia.org/wiki/Endianness">big-endian</a>.</p>
+<h3><a class="header" href="#version-0" id="version-0">Version 0</a></h3>
+<h4><a class="header" href="#handshake" id="handshake"><code>Handshake</code></a></h4>
+<p>Type ID: <code>1</code></p>
+<p>A message that allows two nodes to pair.
+Contains useful information to verify that the pairing node is operating on the same configuration.
+Any difference in configuration will end up in the connection being closed and the nodes not pairing.</p>
+<table><thead><tr><th>Name</th><th>Description</th><th>Type</th><th>Length</th></tr></thead><tbody>
+<tr><td><code>port</code></td><td>Protocol port of the node<sup>1</sup>.</td><td><code>u16</code></td><td>2</td></tr>
+<tr><td><code>timestamp</code></td><td>Timestamp - in ms - when the message was created by the node.</td><td><code>u64</code></td><td>8</td></tr>
+<tr><td><code>coordinator</code></td><td>Public key of the coordinator being tracked by the node.</td><td><code>[u8; 49]</code></td><td>49</td></tr>
+<tr><td><code>minimum_weight_magnitude</code></td><td>Minimum Weight Magnitude of the node.</td><td><code>u8</code></td><td>1</td></tr>
+<tr><td><code>supported_versions</code></td><td>Protocol versions supported by the node<sup>2</sup>.</td><td><code>Vec&lt;u8&gt;</code></td><td>1-32</td></tr>
+</tbody></table>
+<p><sup>1</sup> When an incoming connection is created, a random port is attributed. This field contains the actual port
+being used by the node and is used to match the connection with a potential white-listed peer.</p>
+<p><sup>2</sup> Bit-masks are used to denote what protocol versions the node supports. The LSB acts as a starting point.
+Up to 32 bytes are supported, limiting the number of protocol versions to 256. Examples:</p>
+<ul>
+<li><code>[0b00000001]</code> denotes that the node supports protocol version 1.</li>
+<li><code>[0b00000111]</code> denotes that the node supports protocol versions 1, 2 and 3.</li>
+<li><code>[0b01101110]</code> denotes that the node supports protocol versions 2, 3, 4, 6 and 7.</li>
+<li><code>[0b01101110, 0b01010001]</code> denotes that the node supports protocol versions 2, 3, 4, 6, 7, 9, 13 and 15.</li>
+<li><code>[0b01101110, 0b01010001, 0b00010001]</code> denotes that the node supports protocol versions 2, 3, 4, 6, 7, 9, 13, 15, 17
+and 21.</li>
+</ul>
+<h3><a class="header" href="#version-1" id="version-1">Version 1</a></h3>
+<h4><a class="header" href="#legacygossip" id="legacygossip"><code>LegacyGossip</code></a></h4>
+<p>Type ID: <code>2</code></p>
+<p>A legacy message to broadcast a transaction and request another one at the same time.</p>
+<table><thead><tr><th>Name</th><th>Description</th><th>Type</th><th>Length</th></tr></thead><tbody>
+<tr><td><code>transaction</code></td><td>Transaction to broadcast. Can be compressed<sup>1</sup>.</td><td><code>Vec&lt;u8&gt;</code></td><td>292-1604</td></tr>
+<tr><td><code>hash</code></td><td>Hash of the requested transaction.</td><td><code>[u8; 49]</code></td><td>49</td></tr>
+</tbody></table>
+<p><sup>1</sup> Compression is detailed at the end.</p>
+<p><strong>Note</strong>: This message is the original IRI protocol message before the TLV protocol was introduced. It was kept by
+HORNET for compatibility with IRI but is not used between HORNET nodes. Its &quot;ping-pong&quot; concept has complex consequences
+on the node design and as such will not be implemented by Bee.</p>
+<h3><a class="header" href="#version-2" id="version-2">Version 2</a></h3>
+<h4><a class="header" href="#milestonerequest" id="milestonerequest"><code>MilestoneRequest</code></a></h4>
+<p>Type ID: <code>3</code></p>
+<p>A message to request a milestone.</p>
+<table><thead><tr><th>Name</th><th>Description</th><th>Type</th><th>Length</th></tr></thead><tbody>
+<tr><td><code>index</code></td><td>Index of the requested milestone.</td><td><code>u32</code></td><td>4</td></tr>
+</tbody></table>
+<h4><a class="header" href="#transactionbroadcast" id="transactionbroadcast"><code>TransactionBroadcast</code></a></h4>
+<p>Type ID: <code>4</code></p>
+<p>A message to broadcast a transaction.</p>
+<table><thead><tr><th>Name</th><th>Description</th><th>Type</th><th>Length</th></tr></thead><tbody>
+<tr><td><code>transaction</code></td><td>Transaction to broadcast. Can be compressed<sup>1</sup>.</td><td><code>Vec&lt;u8&gt;</code></td><td>292-1604</td></tr>
+</tbody></table>
+<p><sup>1</sup> Compression is detailed at the end.</p>
+<h4><a class="header" href="#transactionrequest" id="transactionrequest"><code>TransactionRequest</code></a></h4>
+<p>Type ID: <code>5</code></p>
+<p>A message to request a transaction.</p>
+<table><thead><tr><th>Name</th><th>Description</th><th>Type</th><th>Length</th></tr></thead><tbody>
+<tr><td><code>hash</code></td><td>Hash of the requested transaction.</td><td><code>[u8; 49]</code></td><td>49</td></tr>
+</tbody></table>
+<h4><a class="header" href="#heartbeat" id="heartbeat"><code>Heartbeat</code></a></h4>
+<p>Type ID: <code>6</code></p>
+<p>A message that informs about the part of the Tangle currently being fully stored by a node.
+This message is sent when a node:</p>
+<ul>
+<li>just got paired to another node;</li>
+<li>did a local snapshot and pruned away a part of the Tangle;</li>
+<li>solidified a new milestone;</li>
+</ul>
+<p>It also helps other nodes to know if they can ask it a specific transaction.</p>
+<table><thead><tr><th>Name</th><th>Description</th><th>Type</th><th>Length</th></tr></thead><tbody>
+<tr><td><code>solid_milestone_index</code></td><td>Index of the last solid milestone.</td><td><code>u32</code></td><td>4</td></tr>
+<tr><td><code>snapshot_milestone_index</code></td><td>Index of the snapshotted milestone.</td><td><code>u32</code></td><td>4</td></tr>
+</tbody></table>
+<h3><a class="header" href="#compression" id="compression">Compression</a></h3>
+<p>A transaction encoded in bytes - using the T5B1 codec - has a length of <code>1604</code>. The <code>payload</code> field itself occupies
+<code>1312</code> bytes and is often partially or completely filled with <code>0</code>s. For this reason, trailing <code>0</code>s of the <code>payload</code>
+field are removed, providing a compression rate up to nearly 82%. Only the <code>payload</code> field is altered during this
+compression and the order of the fields stays the same.</p>
+<p>Proposed functions:</p>
+<pre><pre class="playpen"><code class="language-rust">
+<span class="boring">#![allow(unused_variables)]
+</span><span class="boring">fn main() {
+</span>fn compress_transaction_bytes(bytes: &amp;[u8]) -&gt; Vec&lt;u8&gt; {
+    ...
+}
+
+fn uncompress_transaction_bytes(bytes: &amp;[u8]) -&gt; [u8; 1604] {
+    ...
+}
+<span class="boring">}
+</span></code></pre></pre>
+<h1><a class="header" href="#drawbacks" id="drawbacks">Drawbacks</a></h1>
+<p>Since IRI nodes only implement version <code>0</code> and <code>1</code> and Bee nodes only implement versions <code>0</code> and <code>2</code>, they will not be
+able to communicate with each other.</p>
+<h1><a class="header" href="#rationale-and-alternatives" id="rationale-and-alternatives">Rationale and alternatives</a></h1>
+<p>There are alternatives to a type-length-value protocol but it is very efficient and easily updatable without breaking
+change. Also, since this is the protocol that has been chosen for the IOTA network, there is no other alternative for
+Bee.</p>
+<h1><a class="header" href="#unresolved-questions" id="unresolved-questions">Unresolved questions</a></h1>
+<p>There are no open questions at this point.
+This protocol has been used for a long time and this RFC will be updated with new message types when/if needed.</p>
+<ul>
+<li>Feature name: <code>configuration</code></li>
+<li>Start date: 2020-05-06</li>
+<li>RFC PR: <a href="https://github.com/iotaledger/bee-rfcs/pull/31">iotaledger/bee-rfcs#31</a></li>
+<li>Bee issue: <a href="https://github.com/iotaledger/bee/issues/71">iotaledger/bee#71</a></li>
+</ul>
+<h1><a class="header" href="#summary-1" id="summary-1">Summary</a></h1>
+<p>This RFC proposes a configuration pattern for Bee binary and library crates.</p>
+<h1><a class="header" href="#motivation-1" id="motivation-1">Motivation</a></h1>
+<p>This RFC contains a set of recommendations regarding configuration management in order to ensure consistency across the
+different Bee crates.</p>
+<h1><a class="header" href="#detailed-design-1" id="detailed-design-1">Detailed design</a></h1>
+<h2><a class="header" href="#libraries" id="libraries">Libraries</a></h2>
+<ul>
+<li><a href="https://github.com/serde-rs/serde">serde</a>: the go-to framework for <strong>ser</strong>ializing and <strong>de</strong>serializing Rust data
+structures efficiently and generically;</li>
+<li><a href="https://github.com/alexcrichton/toml-rs">toml-rs</a>: a TOML encoding/decoding library for Rust with
+serialization/deserialization on top of <code>serde</code>;</li>
+</ul>
+<h2><a class="header" href="#recommendations" id="recommendations">Recommendations</a></h2>
+<p>With the following recommendations, one can:</p>
+<ul>
+<li>read a configuration builder from a file;</li>
+<li>write a configuration to a file;</li>
+<li>manually override fields of a configuration builder;</li>
+<li>construct a configuration from a configuration builder;</li>
+</ul>
+<h3><a class="header" href="#configuration-builder" id="configuration-builder">Configuration Builder</a></h3>
+<p>The <a href="https://rust-lang.github.io/api-guidelines/type-safety.html#c-builder">Builder</a> pattern is very common in Rust when
+it comes to constructing complex objects like configurations.</p>
+<p>A configuration builder type should:</p>
+<ul>
+<li>have a name suffixed by <code>ConfigBuilder</code>;</li>
+<li>derive the following traits;
+<ul>
+<li><code>Default</code> to easily implement the <code>new</code> method as convention;</li>
+<li><code>Deserialize</code>, from <code>serde</code>, to deserialize from a configuration file;</li>
+</ul>
+</li>
+<li>provide a <code>new</code> method;</li>
+<li>have <code>Option</code> fields;
+<ul>
+<li>if there is a configuration file, the fields should have the same names as the keys;</li>
+</ul>
+</li>
+<li>provide setters to set/override the fields;</li>
+<li>provide a <code>finish</code> method constructing the actual configuration object;</li>
+<li>have default values defined as <code>const</code> and set with <code>Option::unwrap_or</code>/<code>Option::unwrap_or_else</code>;</li>
+</ul>
+<p>Here is a small example fitting all these requirements.</p>
+<p><code>config.toml</code></p>
+<pre><code class="language-toml">[snapshot]
+meta_file_path  = &quot;./data/snapshot/mainnet.snapshot.meta&quot;
+state_file_path = &quot;./data/snapshot/mainnet.snapshot.state&quot;
+</code></pre>
+<p><code>config.rs</code></p>
+<pre><pre class="playpen"><code class="language-rust">
+<span class="boring">#![allow(unused_variables)]
+</span><span class="boring">fn main() {
+</span>const DEFAULT_META_FILE_PATH: &amp;str = &quot;./data/snapshot/mainnet.snapshot.meta&quot;;
+const DEFAULT_STATE_FILE_PATH: &amp;str = &quot;./data/snapshot/mainnet.snapshot.state&quot;;
+
+#[derive(Default, Deserialize)]
+pub struct SnapshotConfigBuilder {
+    meta_file_path: Option&lt;String&gt;,
+    state_file_path: Option&lt;String&gt;,
+}
+
+impl SnapshotConfigBuilder {
+    pub fn new() -&gt; Self {
+        Self::default()
+    }
+
+    pub fn meta_file_path(mut self, meta_file_path: String) -&gt; Self {
+        self.meta_file_path.replace(meta_file_path);
+        self
+    }
+
+    pub fn state_file_path(mut self, state_file_path: String) -&gt; Self {
+        self.state_file_path.replace(state_file_path);
+        self
+    }
+
+    pub fn finish(self) -&gt; SnapshotConfig {
+        SnapshotConfig {
+            meta_file_path: self.meta_file_path.unwrap_or(DEFAULT_META_FILE_PATH.to_string()),
+            state_file_path: self.state_file_path.unwrap_or(DEFAULT_STATE_FILE_PATH.to_string()),
+        }
+    }
+}
+<span class="boring">}
+</span></code></pre></pre>
+<h3><a class="header" href="#configuration" id="configuration">Configuration</a></h3>
+<p>A configuration type should:</p>
+<ul>
+<li>have a name suffixed by <code>Config</code>;</li>
+<li>derive the following traits;
+<ul>
+<li><code>Clone</code>, since all configuration are most probably aggregated in a common configuration after reading from a file,
+this trait is needed to give components a unique ownership of their own configuration;</li>
+<li><code>Serialize</code> if the configuration is expected to be updated and saved;</li>
+</ul>
+</li>
+<li>provide a <code>build</code> method that returns a new instance of the associated builder;</li>
+<li>have the same fields with the same names, without <code>Option</code>, as the builder;</li>
+<li>have no public fields;</li>
+<li>provide setters/updaters only on fields that are expected to be updatable;</li>
+<li>have getters or <code>pub(crate)</code> fields;</li>
+</ul>
+<p>Here is a small example fitting all these requirements:</p>
+<p><code>config.toml</code></p>
+<pre><code class="language-toml">[snapshot]
+meta_file_path  = &quot;./data/snapshot/mainnet.snapshot.meta&quot;
+state_file_path = &quot;./data/snapshot/mainnet.snapshot.state&quot;
+</code></pre>
+<p><code>config.rs</code></p>
+<pre><pre class="playpen"><code class="language-rust">
+<span class="boring">#![allow(unused_variables)]
+</span><span class="boring">fn main() {
+</span>#[derive(Clone)]
+pub struct SnapshotConfig {
+    meta_file_path: String,
+    state_file_path: String,
+}
+
+impl SnapshotConfig {
+    pub fn build() -&gt; SnapshotConfigBuilder {
+      SnapshotConfig::new()
+    }
+
+    pub fn meta_file_path(&amp;self) -&gt; &amp;String {
+        &amp;self.meta_file_path
+    }
+
+    pub fn state_file_path(&amp;self) -&gt; &amp;String {
+        &amp;self.state_file_path
+    }
+}
+
+<span class="boring">}
+</span></code></pre></pre>
+<h3><a class="header" href="#read-a-configuration-builder-from-a-file" id="read-a-configuration-builder-from-a-file">Read a configuration builder from a file</a></h3>
+<pre><pre class="playpen"><code class="language-rust">
+<span class="boring">#![allow(unused_variables)]
+</span><span class="boring">fn main() {
+</span>let config_builder = match fs::read_to_string(&quot;config.toml&quot;) {
+    Ok(toml) =&gt; match toml::from_str::&lt;SnapshotConfigBuilder&gt;(&amp;toml) {
+        Ok(config_builder) =&gt; config_builder,
+        Err(e) =&gt; {
+            // Handle error
+        }
+    },
+    Err(e) =&gt; {
+        // Handle error
+    }
+};
+
+// Override fields if necessary e.g. with CLI arguments.
+
+let config = config_builder.finish();
+<span class="boring">}
+</span></code></pre></pre>
+<h3><a class="header" href="#write-a-configuration-to-a-file" id="write-a-configuration-to-a-file">Write a configuration to a file</a></h3>
+<pre><pre class="playpen"><code class="language-rust">
+<span class="boring">#![allow(unused_variables)]
+</span><span class="boring">fn main() {
+</span>match toml::to_string(&amp;config) {
+    Ok(toml) =&gt; match fs::File::create(&quot;config.toml&quot;) {
+        Ok(mut file) =&gt; {
+            if let Err(e) = file.write_all(toml.as_bytes()) {
+                // Handle error
+            }
+        }
+        Err(e) =&gt; {
+            // Handle error
+        }
+    },
+    Err(e) =&gt; {
+        // Handle error
+    }
+}
+<span class="boring">}
+</span></code></pre></pre>
+<h3><a class="header" href="#sub-configuration" id="sub-configuration">Sub-configuration</a></h3>
+<p>It is also very easy to create sub-configurations by nesting configuration builders and configurations.</p>
+<p><code>config.toml</code></p>
+<pre><code class="language-toml">[snapshot]
+[snapshot.local]
+meta_file_path  = &quot;./data/snapshot/local/mainnet.snapshot.meta&quot;
+state_file_path = &quot;./data/snapshot/local/mainnet.snapshot.state&quot;
+[snapshot.global]
+file_path       = &quot;./data/snapshot/global/mainnet.txt&quot;
+</code></pre>
+<p><code>config.rs</code></p>
+<pre><pre class="playpen"><code class="language-rust">
+<span class="boring">#![allow(unused_variables)]
+</span><span class="boring">fn main() {
+</span>#[derive(Default, Deserialize)]
+pub struct LocalSnapshotConfigBuilder {
+    meta_file_path: Option&lt;String&gt;,
+    state_file_path: Option&lt;String&gt;,
+}
+
+#[derive(Default, Deserialize)]
+pub struct GlobalSnapshotConfigBuilder {
+    file_path: Option&lt;String&gt;,
+}
+
+#[derive(Default, Deserialize)]
+pub struct SnapshotConfigBuilder {
+    local: LocalSnapshotConfigBuilder,
+    global: GlobalSnapshotConfigBuilder,
+}
+
+impl SnapshotConfigBuilder {
+    pub fn new() -&gt; Self {
+        Self::default()
+    }
+
+    // Setters
+
+    pub fn finish(self) -&gt; SnapshotConfig {
+        SnapshotConfig {
+            local: LocalSnapshotConfig {
+                meta_file_path: self
+                    .local
+                    .meta_file_path
+                    .unwrap_or(DEFAULT_LOCAL_SNAPSHOT_META_FILE_PATH.to_string()),
+                state_file_path: self
+                    .local
+                    .state_file_path
+                    .unwrap_or(DEFAULT_LOCAL_SNAPSHOT_STATE_FILE_PATH.to_string()),
+            },
+            global: GlobalSnapshotConfig {
+                file_path: self
+                    .global
+                    .file_path
+                    .unwrap_or(DEFAULT_GLOBAL_SNAPSHOT_FILE_PATH.to_string()),
+            },
+        }
+    }
+}
+#[derive(Clone)]
+pub struct LocalSnapshotConfig {
+    meta_file_path: String,
+    state_file_path: String,
+}
+
+#[derive(Clone)]
+pub struct GlobalSnapshotConfig {
+    file_path: String,
+}
+
+#[derive(Clone)]
+pub struct SnapshotConfig {
+    local: LocalSnapshotConfig,
+    global: GlobalSnapshotConfig,
+}
+
+// Impl
+
+<span class="boring">}
+</span></code></pre></pre>
+<h1><a class="header" href="#drawbacks-1" id="drawbacks-1">Drawbacks</a></h1>
+<p>No specific drawback with this approach.</p>
+<h1><a class="header" href="#rationale-and-alternatives-1" id="rationale-and-alternatives-1">Rationale and alternatives</a></h1>
+<p>Many configuration formats are usually considered:</p>
+<ul>
+<li><a href="https://github.com/toml-lang/toml">TOML</a></li>
+<li><a href="https://www.json.org/json-en.html">JSON</a></li>
+<li><a href="https://github.com/lightbend/config/blob/master/HOCON.md">HOCON</a></li>
+<li><a href="https://yaml.org/">YAML</a></li>
+<li><a href="https://www.w3.org/XML/">XML</a></li>
+<li><a href="https://github.com/ron-rs/ron">RON</a></li>
+</ul>
+<p>This RFC and its expected implementations are choosing <code>TOML</code> as a first default configuration format because it is the
+preferred option in the Rust ecosystem. However, it is not excluded by this RFC that other formats may be provided in
+the future, <code>serde</code> making it very easy to support other formats. It is also important to note that TOML only provides
+a limited amount of layers of nesting due to its non-recursive syntax, which may eventually become an issue.</p>
+<p><code>Serde</code> itself has been chosen because it is the standard for serialization/deserialization in Rust.</p>
+<h1><a class="header" href="#unresolved-questions-1" id="unresolved-questions-1">Unresolved questions</a></h1>
+<p>In case of binary crates, e.g.<code>bee-node</code>, configuration with CLI arguments is not described in this RFC but everything
+is already set up to support it seamlessly. The builder setters allow setting fields or overriding fields that may
+have already pre-filled by the parsing of a configuration file. A CLI parser library like
+<a href="https://github.com/clap-rs/clap">clap</a> may be used on top of the builders;</p>
+<ul>
+<li>Feature name: <code>network</code></li>
+<li>Start date: 2020-04-29</li>
+<li>RFC PR: <a href="https://github.com/iotaledger/bee-rfcs/pull/33">iotaledger/bee-rfcs#33</a></li>
+<li>Bee issue: <a href="https://github.com/iotaledger/bee/issues/76">iotaledger/bee#76</a></li>
+</ul>
+<h1><a class="header" href="#summary-2" id="summary-2">Summary</a></h1>
+<p>This RFC proposes a networking crate (<code>bee-network</code>) to be added to the <strong>Bee</strong> framework that provides means to exchange byte messages with connected endpoints.</p>
+<h1><a class="header" href="#motivation-2" id="motivation-2">Motivation</a></h1>
+<p>Bee nodes need a way to share messages with each other and other compatible node implementations as part of the IOTA gossip protocol or they won't be able to form a network and synchronize with each other.</p>
+<h1><a class="header" href="#detailed-design-2" id="detailed-design-2">Detailed design</a></h1>
+<p>The functionalities of this crate are relatively low-level from a node perspective in the sense, that they are independent from any specifics defined by the IOTA protocol. Consequently, it has no dependencies on other crates of the framework, and can easily be reused in different contexts.</p>
+<p>The aim of this crate is to make it simple and straightforward for developers to build layers on top of it (e.g. a protocol layer) by abstracting away all the underlying networking logic. It is therefore a lot easier for them to focus on the modelling of other important aspects of a node software, like:</p>
+<ul>
+<li><code>Peer</code>s: other nodes in the network,</li>
+<li><code>Message</code>es: the information exchanged between peers, and its serialization/deserialization.</li>
+</ul>
+<p>Given some identifier <code>epid</code>, sending a message to its corresponding endpoint becomes a single line of asynchronous code:</p>
+<pre><pre class="playpen"><code class="language-rust">
+<span class="boring">#![allow(unused_variables)]
+</span><span class="boring">fn main() {
+</span>network.send(SendMessage { epid, bytes: &quot;hello&quot;.as_bytes() }).await?;
+<span class="boring">}
+</span></code></pre></pre>
+<p>The purpose of this crate is to provide the following functionalities:</p>
+<ul>
+<li>maintain a list of endpoints,</li>
+<li>establish and maintain connections with endpoints,</li>
+<li>allow to send, multicast or broadcast byte encoded messages of variable size to any of the endpoints,</li>
+<li>allow to receive byte encoded messages of variable size from any of the endpoints,</li>
+<li>reject connections from unknown, i.e. not whitelisted, endpoints,</li>
+<li>manage all connections and message transfers asynchronously,</li>
+<li>provide an extensible, yet convenient-to-use, and documented API.</li>
+</ul>
+<p>The key design decisions are now being discussed in the following sub-sections.</p>
+<h2><a class="header" href="#asyncawait" id="asyncawait">async/await</a></h2>
+<p>This crate is by nature very much dependent on events happening outside of the control of the program, e.g. listening for incoming connections from peers, waiting for packets on a specific socket, etc. Hence, - under the hood - this crate makes heavy use of Rust's concurrency abstractions. Luckily, with the stabilization of the <code>async/await</code> syntax, writing asynchronous code has become almost as easy to read, write, and maintain as synchronous code. In an experimental implementation of this crate the <a href="https://github.com/async-rs/async-std"><code>async_std</code></a> library was used, which comes with asynchronous drop-in replacements for their synchronous equivalents found in Rust's standard library <code>std</code>. Additionally, asynchronous mpsc channels were taken from the <a href="https://github.com/rust-lang/futures-rs"><code>futures</code></a> crate.</p>
+<h2><a class="header" href="#message-passing" id="message-passing">Message passing</a></h2>
+<p>This crate favors message passing via channels over globally shared state and locks. Instead of keeping the list of endpoints in a globally accessible hashmap this crate separates and moves such state into workers that run asynchronously, and are listening for commands and events to act upon, and also notify listeners by sending events.</p>
+<h2><a class="header" href="#initialization" id="initialization">Initialization</a></h2>
+<p>In order for this crate to be used, it has to be initialized first by providing a <code>NetworkConfig</code>:</p>
+<pre><pre class="playpen"><code class="language-rust">
+<span class="boring">#![allow(unused_variables)]
+</span><span class="boring">fn main() {
+</span>struct NetworkConfig {
+    // The server or binding TCP port that remote endpoints can connect and send to.
+    binding_port: u16,
+    // The binding address that remote endpoints can connect and send to.
+    binding_addr: IpAddr,
+    // The interval between two connection attempts in case of connection failures.
+    reconnect_interval: u64,
+    // The maximum message length in terms of bytes.
+    max_message_length: usize
+
+    ...
+}
+<span class="boring">}
+</span></code></pre></pre>
+<p>This has the advantage of being easily extensible and keeping the signature of the static <code>init</code> function small:</p>
+<pre><pre class="playpen"><code class="language-rust">
+<span class="boring">#![allow(unused_variables)]
+</span><span class="boring">fn main() {
+</span>fn init(config: NetworkConfig) -&gt; (Network, Events, Shutdown) { ... }
+<span class="boring">}
+</span></code></pre></pre>
+<p>This function returns a tuple struct that allows the consumer of this crate to send commands (<code>Network</code>), listen to events (<code>Events</code>), and gracefully shutdown all running asynchronous tasks that were spawned within this system (<code>Shutdown</code>).</p>
+<p>See also  <a href="https://github.com/iotaledger/bee-rfcs/blob/master/text/0031-configuration.md">RFC 31</a>, which describes a configuration pattern for Bee binary and library crates.</p>
+<h2><a class="header" href="#port-address-protocol-and-url" id="port-address-protocol-and-url"><code>Port</code>, <code>Address</code>, <code>Protocol</code>, and <code>Url</code></a></h2>
+<p>In order to send a message to an endpoint, a node needs to know the endpoint's address and the communication protocol it uses. This crate provides the following abstractions to deal with that:</p>
+<ul>
+<li>
+<p><code>Port</code>: a 0-cost wrapper around a <code>u16</code>, which is introduced for type safety and better readability:</p>
+<pre><pre class="playpen"><code class="language-rust">
+<span class="boring">#![allow(unused_variables)]
+</span><span class="boring">fn main() {
+</span>struct Port(u16);
+<span class="boring">}
+</span></code></pre></pre>
+<p>For convenience, <code>Port</code> dereferences to <code>u16</code>.</p>
+</li>
+<li>
+<p><code>Address</code>: a 0-cost wrapper around a <code>SocketAddr</code> which provides an adjusted, but overall simpler API than its inner type:</p>
+<pre><pre class="playpen"><code class="language-rust">
+<span class="boring">#![allow(unused_variables)]
+</span><span class="boring">fn main() {
+</span>#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct Address(SocketAddr);
+<span class="boring">}
+</span></code></pre></pre>
+<p>An <code>Address</code> can be constructed from Ipv4 and Ipv6 addresses and a port:</p>
+<pre><pre class="playpen"><code class="language-rust">
+<span class="boring">#![allow(unused_variables)]
+</span><span class="boring">fn main() {
+</span>// Infallible construction of an `Address` from Ipv4.
+fn from_v4_addr_and_port(address: Ipv4Addr, port: Port) -&gt; Self { ... }
+
+// Infallible construction of an `Address` from Ipv6.
+fn from_v6_addr_and_port(address: Ipv6Addr, port: Port) -&gt; Self { ... }
+
+// Fallible construction of an `Address` from `&amp;str`.
+async fn from_addr_str(address: &amp;str) -&gt; Result&lt;Self&gt; { ... }
+<span class="boring">}
+</span></code></pre></pre>
+<p>Note, that the last function is <code>async</code>. That is because of possible delays when performing domain name resolution.</p>
+</li>
+<li>
+<p><code>Protocol</code>: an <code>enum</code>eration of supported communication protocols:</p>
+<pre><pre class="playpen"><code class="language-rust">
+<span class="boring">#![allow(unused_variables)]
+</span><span class="boring">fn main() {
+</span>#[non_exhaustive]
+enum Protocol {
+    Tcp,
+}
+<span class="boring">}
+</span></code></pre></pre>
+<p>Note, that future updates may support different protocols, which is why this enum is declared as <code>non_exhaustive</code>, see <code>Unresolved Questions</code> section.</p>
+</li>
+<li>
+<p><code>Url</code>: an <code>enum</code>eration that can always be constructed from an <code>Address</code> and a <code>Protocol</code> (infallible), or from a <code>&amp;str</code>, which can fail if parsing or domain name resolution fails. If successfull however, it resolves to an Ipv4 or Ipv6 address stored in a variant of the <code>enum</code> depending on the url scheme part. Note, that this crate therefore expects the <code>Url</code> string to always provide a scheme (e.g. <code>tcp://</code>) and a port (e.g. <code>15600</code>) when specifying an endpoint's address.</p>
+<pre><pre class="playpen"><code class="language-rust">
+<span class="boring">#![allow(unused_variables)]
+</span><span class="boring">fn main() {
+</span>#[non_exhaustive]
+enum Url {
+    // Represents the address of an endpoint communicating over TCP.
+    Tcp(Address),
+}
+<span class="boring">}
+</span></code></pre></pre>
+<p>Note, that future updates may support different protocols, which is why this enum is declared as <code>non_exhaustive</code>, see <code>Unresolved Questions</code> section.</p>
+<pre><pre class="playpen"><code class="language-rust">
+<span class="boring">#![allow(unused_variables)]
+</span><span class="boring">fn main() {
+</span>// Infallible construction of a `Url` from an `Address` and a `Protocol`.
+fn new(addr: Address, proto: Protocol) -&gt; Self { ... }
+
+// Fallible construction of a `Url` from `&amp;str`.
+async fn from_url_str(url: &amp;str) -&gt; Result&lt;Self&gt; { ... }
+<span class="boring">}
+</span></code></pre></pre>
+<p>Note, that the second function is <code>async</code>. That is because of possible delays when performing domain name resolution.</p>
+</li>
+</ul>
+<h2><a class="header" href="#endpoint-and-endpointid" id="endpoint-and-endpointid"><code>Endpoint</code> and <code>EndpointId</code></a></h2>
+<p>To model the remote part of a connection, this crate introduces the <code>Endpoint</code> type:</p>
+<pre><pre class="playpen"><code class="language-rust">
+<span class="boring">#![allow(unused_variables)]
+</span><span class="boring">fn main() {
+</span>struct Endpoint {
+    // The id of the endpoint.
+    id: EndpointId,
+
+    // The address of the endpoint.
+    address: Address,
+
+    // The protocol used to communicate with that endpoint.
+    protocol: Protocol,
+}
+<span class="boring">}
+</span></code></pre></pre>
+<p>Note: In a peer-to-peer (p2p) network peers usually have two endpoints initially as they are actively trying to connect, but also need to accept connections from their peers. This crate is agnostic about how to handle duplicate connections as this is usually resolved by a handshaking protocol defined at a higher layer.</p>
+<p>To uniquely identify an <code>Endpoint</code>, this crate proposes the <code>EndpointId</code> type, which can be implemented as a wrapper around an <code>Address</code>.</p>
+<pre><pre class="playpen"><code class="language-rust">
+<span class="boring">#![allow(unused_variables)]
+</span><span class="boring">fn main() {
+</span>#[derive(Clone, Copy, Eq, PartialEq, Hash)]
+struct EndpointId(Address);
+<span class="boring">}
+</span></code></pre></pre>
+<p>Note, that this <code>EndpointId</code> should be <code>Clone</code> and <code>Copy</code>, and requires to implement <code>Eq</code>, <code>PartialEq</code>, and <code>Hash</code>, because it is used as a hashmap key in several instances.</p>
+<h2><a class="header" href="#command" id="command"><code>Command</code></a></h2>
+<p><code>Command</code>s are messages that are supposed to be issued by higher level business logic like a protocol layer. They are implemented as an <code>enum</code>, which in Rust is one way of expressing a polymorphic type:</p>
+<pre><pre class="playpen"><code class="language-rust">
+<span class="boring">#![allow(unused_variables)]
+</span><span class="boring">fn main() {
+</span>enum Command {
+    // Adds an endpoint to the list.
+    AddEndpoint { url: Url, ... },
+
+    // Removes an endpoint from the list.
+    RemoveEndpoint { epid: EndpointId, ... },
+
+    // Attempts to connect to an endpoint.
+    Connect { epid: EndpointId, ... },
+
+    // Disconnects from an endpoint.
+    Disconnect { epid: EndpointId, ... },
+
+    // Sends a message to a particular endpoint.
+    SendMessage { epid: EndpointId, bytes: Vec&lt;u8&gt;, ... },
+
+    // Sends a message to multiple endpoints.
+    MulticastMessage { epids: Vec&lt;EndpointId&gt;, bytes: Vec&lt;u8&gt;, ...},
+
+    // Sends a message to all endpoints in its list.
+    BroadcastMessage { bytes: Vec&lt;u8&gt;, ... },
+}
+<span class="boring">}
+</span></code></pre></pre>
+<p>This <code>enum</code> makes the things the consumer can do with the crate very explicit and descriptive, and also easily extensible.</p>
+<h3><a class="header" href="#event" id="event"><code>Event</code></a></h3>
+<p>Similarly to <code>Command</code>s, the different kinds of <code>Event</code>s in the system are implemented as an <code>enum</code> allowing various types of concrete events being sent over event channels:</p>
+<pre><pre class="playpen"><code class="language-rust">
+<span class="boring">#![allow(unused_variables)]
+</span><span class="boring">fn main() {
+</span>#[non_exhaustive]
+enum Event {
+    // An endpoint was added to the list.
+    EndpointAdded { epid: EndpointId, ... },
+
+    // An endpoint was removed from the list.
+    EndpointRemoved { epid: EndpointId, ... },
+
+    // A new connection is being set up.
+    NewConnection { ep: Endpoint, ... },
+
+    // A broken connection.
+    LostConnection { epid: EndpointId },
+
+    // An endpoint was successfully connected.
+    EndpointConnected { epid: EndpointId, address: Address, ... },
+
+    // An endpoint was disconnected.
+    EndpointDisconnected { epid: EndpointId, ... },
+
+    // A message was sent.
+    MessageSent { epid: EndpointId, num_bytes: usize },
+
+    // A message was received.
+    MessageReceived { epid: EndpointId, bytes: Vec&lt;u8&gt; },
+
+    // A connection attempt should occur.
+    TryConnect { epid: EndpointId, ... },
+}
+
+<span class="boring">}
+</span></code></pre></pre>
+<p>In contrast to <code>Command</code>s though, <code>Event</code>s are messages created by the system, and those that are considered relevant are published for the consumer to execute custom logic. It is attributed as <code>non_exhaustive</code> to accommodate for possible additions in the future.</p>
+<h2><a class="header" href="#workers" id="workers">Workers</a></h2>
+<p>There are two essential asynchronous workers in the system that are running for the application's whole lifetime. That is the <code>EndpointWorker</code> and the <code>TcpWorker</code>.</p>
+<h3><a class="header" href="#endpointworker" id="endpointworker">EndpointWorker</a></h3>
+<p>This worker manages the list of <code>Endpoint</code>s and processes the <code>Command</code>s issued by the consumer of this crate, and publishes <code>Event</code>s to be consumed by the user.</p>
+<h3><a class="header" href="#tcpworker" id="tcpworker">TcpWorker</a></h3>
+<p>This worker is responsible for accepting incoming TCP connection requests from other endpoints. Once a connection is established two additional asynchronous tasks are spawned that respectively handle incoming and outgoing messages.</p>
+<p>Note: connection attempts from unknown IP addresses (i.e. not part of the static whitelist) will be rejected.</p>
+<h2><a class="header" href="#shutdown" id="shutdown">Shutdown</a></h2>
+<p><code>Shutdown</code> is a <code>struct</code> that facilitates a graceful shutdown. It stores the sender halfs of <code>oneshot</code> channels (<code>ShutdownNotifier</code>) and the task handles (<code>WorkerTask</code>).</p>
+<pre><pre class="playpen"><code class="language-rust">
+<span class="boring">#![allow(unused_variables)]
+</span><span class="boring">fn main() {
+</span>struct Shutdown {
+    notifiers: Vec&lt;ShutdownNotifier&gt;,
+    tasks: Vec&lt;WorkerTask&gt;,
+}
+<span class="boring">}
+</span></code></pre></pre>
+<p>Apart from providing the necessary API to register channels and tasks, executing the shutdown happens by calling:</p>
+<pre><pre class="playpen"><code class="language-rust">
+<span class="boring">#![allow(unused_variables)]
+</span>
+<span class="boring">fn main() {
+</span>async fn execute(self) -&gt; Result&lt;()&gt; { ... }
+
+<span class="boring">}
+</span></code></pre></pre>
+<p>This method will then try to send a shutdown signal to all registered workers and wait for those tasks to complete.</p>
+<h1><a class="header" href="#drawbacks-2" id="drawbacks-2">Drawbacks</a></h1>
+<ul>
+<li>This design might not be the most performant solution as it requires each byte message to be wrapped into a <code>SendMessage</code> command, that is then sent through a channel to the <code>EndpointWorker</code>. Proper benchmarking is necessary to determine if this design can be a performance bottleneck;</li>
+<li>Currently UDP is not a requirement, so the proposal focuses on TCP only. Nonetheless, the crate is designed in way that allows for simple addition of UDP support;</li>
+</ul>
+<h1><a class="header" href="#rationale-and-alternatives-2" id="rationale-and-alternatives-2">Rationale and alternatives</a></h1>
+<ul>
+<li>The reason for not choosing an already available crate, is that there aren't many crates yet, that are implemented in the proposed way, and are also widely used in the Rust ecosystem. Additionally we reduce dependencies, and have the option to tailor the crate exactly to our needs even on short notice;</li>
+<li>There are many ways to implement such a crate, many of which are probably more performant than the proposed one. However, the main focus of this proposal is ease-of-use and extensibility. It leaves performance optimization to later versions and/or RFCs, when more data has been collected through stress tests and benchmarks;</li>
+<li>In particular, the <code>Command</code> abstraction could be removed entirely, and replaced by an additional static function for each command. This might be a more efficient thing to do, but it is still unclear how much there is to be gained by doing this, and if this would be necessary taking into account the various other CPU expensive things like hashing, signature verification, etc, that a node needs to do;</li>
+<li>Since mpsc channels are still unstable in <code>async_std</code> at the time of this writing, this RFC suggests using those from the <code>futures</code> crate. Once this has been stabilized, a swith to those channels might improve performance, since to the authors knowledge those are based on the more efficient <code>crossbeam</code> implementation;</li>
+<li>To implement this RFC, any async library or mix can be used. Other options to consider are <a href="https://github.com/tokio-rs/tokio"><code>tokio</code></a>, and for asynchronous channels <a href="https://github.com/zesterer/flume"><code>flume</code></a>. Using those libraries, might result in a much more efficient implementation;</li>
+<li><code>EndpointId</code> may be something different than a wrapper around an <code>Address</code>, but instead be derived from some sort of cryptographic hash;</li>
+</ul>
+<h1><a class="header" href="#unresolved-questions-2" id="unresolved-questions-2">Unresolved questions</a></h1>
+<ul>
+<li>The design has been tested in a prototype, and it seems to work reliably, so there are no unresolved questions in terms of the validity of this proposal;</li>
+<li>It is still unclear - due to the lack of benchmark results - how efficient this design is; however, due to its asynchronous design it should be able to make use from multicore systems;</li>
+<li>Handling of endpoints with dynamic IPs;</li>
+</ul>
 
                     </main>
 
